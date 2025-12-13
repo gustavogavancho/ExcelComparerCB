@@ -12,6 +12,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<DiffItem> _diffs = new();
     private readonly ICollectionView _diffsView;
     private CancellationTokenSource? _cts;
+    private string? _selectedSheetFilter;
 
     public MainWindow()
     {
@@ -19,6 +20,7 @@ public partial class MainWindow : Window
 
         _diffsView = CollectionViewSource.GetDefaultView(_diffs);
         _diffsView.Filter = FilterDiffs;
+        _diffsView.GroupDescriptions.Add(new PropertyGroupDescription(nameof(DiffItem.Sheet)));
 
         GridDiffs.ItemsSource = _diffsView;
         Prog.Value = 0;
@@ -57,6 +59,7 @@ public partial class MainWindow : Window
         Prog.Value = 0;
         _diffs.Clear();
         TreeSummary.Items.Clear();
+        _selectedSheetFilter = null;
 
         _cts = new CancellationTokenSource();
 
@@ -116,6 +119,10 @@ public partial class MainWindow : Window
     {
         if (obj is not DiffItem d) return false;
 
+        // Filter by selected sheet if any
+        if (!string.IsNullOrEmpty(_selectedSheetFilter) && !string.Equals(d.Sheet, _selectedSheetFilter, StringComparison.OrdinalIgnoreCase))
+            return false;
+
         var q = TxtFilter.Text?.Trim();
         if (string.IsNullOrWhiteSpace(q)) return true;
 
@@ -146,11 +153,23 @@ public partial class MainWindow : Window
             var sheetNode = new TreeViewItem
             {
                 Header = $"{g.Key}   (+{added}  ~{modified}  -{removed})",
-                IsExpanded = false
+                IsExpanded = false,
+                Tag = g.Key
             };
             root.Items.Add(sheetNode);
         }
 
         return root;
+    }
+
+    private void TreeSummary_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+    {
+        // If sheet node selected, set filter; selecting root clears
+        if (TreeSummary.SelectedItem is TreeViewItem item)
+        {
+            var sheetName = item.Tag as string;
+            _selectedSheetFilter = sheetName;
+            _diffsView.Refresh();
+        }
     }
 }

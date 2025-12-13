@@ -73,7 +73,7 @@
                 </StackPanel>
 
                 <GroupBox Header="Resumen" DockPanel.Dock="Bottom">
-                    <TreeView x:Name="TreeSummary" />
+                    <TreeView x:Name="TreeSummary" SelectedItemChanged="TreeSummary_SelectedItemChanged" />
                 </GroupBox>
             </DockPanel>
 
@@ -82,15 +82,38 @@
                     <TextBox x:Name="TxtFilter" DockPanel.Dock="Top" Margin="6" Height="26"
                              TextChanged="TxtFilter_TextChanged"/>
                     <DataGrid x:Name="GridDiffs" Margin="6" AutoGenerateColumns="False" IsReadOnly="True"
-                              CanUserAddRows="False" SelectionMode="Single">
+                              CanUserAddRows="False" SelectionMode="Single"
+                              GridLinesVisibility="Horizontal" HeadersVisibility="Column"
+                              AlternatingRowBackground="#FFF5F5F5" AlternationCount="2"
+                              RowHeaderWidth="0">
+                        <DataGrid.Resources>
+                            <Style x:Key="WrapCell" TargetType="TextBlock">
+                                <Setter Property="TextWrapping" Value="Wrap"/>
+                                <Setter Property="Padding" Value="2"/>
+                            </Style>
+                        </DataGrid.Resources>
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="Sheet" Binding="{Binding Sheet}" Width="140"/>
-                            <DataGridTextColumn Header="Address" Binding="{Binding Address}" Width="90"/>
-                            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
-                            <DataGridTextColumn Header="What" Binding="{Binding What}" Width="120"/>
-                            <DataGridTextColumn Header="Before" Binding="{Binding Before}" Width="*"/>
-                            <DataGridTextColumn Header="After" Binding="{Binding After}" Width="*"/>
+                            <DataGridTextColumn Header="Sheet" Binding="{Binding Sheet}" Width="140" ElementStyle="{StaticResource WrapCell}"/>
+                            <DataGridTextColumn Header="Address" Binding="{Binding Address}" Width="90" ElementStyle="{StaticResource WrapCell}"/>
+                            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90" ElementStyle="{StaticResource WrapCell}"/>
+                            <DataGridTextColumn Header="What" Binding="{Binding What}" Width="150" ElementStyle="{StaticResource WrapCell}"/>
+                            <DataGridTextColumn Header="Before" Binding="{Binding Before}" Width="*" ElementStyle="{StaticResource WrapCell}"/>
+                            <DataGridTextColumn Header="After" Binding="{Binding After}" Width="*" ElementStyle="{StaticResource WrapCell}"/>
                         </DataGrid.Columns>
+                        <DataGrid.GroupStyle>
+                            <GroupStyle>
+                                <GroupStyle.HeaderTemplate>
+                                    <DataTemplate>
+                                        <TextBlock FontWeight="Bold" Background="#FFEFEFEF" Padding="4" Text="{Binding Name}"/>
+                                    </DataTemplate>
+                                </GroupStyle.HeaderTemplate>
+                                <GroupStyle.Panel>
+                                    <ItemsPanelTemplate>
+                                        <DataGridRowsPresenter/>
+                                    </ItemsPanelTemplate>
+                                </GroupStyle.Panel>
+                            </GroupStyle>
+                        </DataGrid.GroupStyle>
                     </DataGrid>
                 </DockPanel>
             </GroupBox>

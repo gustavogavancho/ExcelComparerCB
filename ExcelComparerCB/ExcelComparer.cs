@@ -14,7 +14,6 @@ public sealed class ExcelComparer
         IProgress<ProgressInfo>? progress,
         CancellationToken ct)
     {
-        // CPU/I/O bound: lo llevamos a background thread
         return await Task.Run(() =>
         {
             ct.ThrowIfCancellationRequested();
@@ -28,11 +27,14 @@ public sealed class ExcelComparer
             var wbA = ReadWorkbook(docA);
             var wbB = ReadWorkbook(docB);
 
-            // 1) Diff de hojas
             progress?.Report(new ProgressInfo(5, "Comparando hojas..."));
             DiffSheets(wbA, wbB, result, options);
 
-            // 2) Diff de celdas por hoja
+            if (options.CompareSheetOrder)
+            {
+                DiffSheetOrder(docA, docB, result);
+            }
+
             var allSheetNames = wbA.SheetsByName.Keys
                 .Union(wbB.SheetsByName.Keys)
                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -46,24 +48,33 @@ public sealed class ExcelComparer
                 var sheetName = allSheetNames[i];
                 var pct = 10 + (int)((i / (double)Math.Max(1, total)) * 85);
 
-                progress?.Report(new ProgressInfo(pct, $"Comparando celdas: {sheetName} ({i + 1}/{total})"));
+                progress?.Report(new ProgressInfo(pct, $"Comparando hoja: {sheetName} ({i + 1}/{total})"));
 
-                // Si una hoja existe solo en A o solo en B, igualmente reportamos (ya se reportó como sheet add/remove)
-                // Para MVP, solo comparamos celdas si existe en ambos.
                 if (!wbA.SheetsByName.TryGetValue(sheetName, out var sA) ||
                     !wbB.SheetsByName.TryGetValue(sheetName, out var sB))
                 {
                     continue;
                 }
 
-                // Excluir ocultas si el usuario lo pide
                 if (!options.IncludeHiddenSheets && (sA.Hidden || sB.Hidden))
                     continue;
 
-                var cellsA = ReadCells(docA, sA);
-                var cellsB = ReadCells(docB, sB);
+                if (options.CompareUsedRange)
+                    DiffUsedRange(docA, docB, sA, sB, sheetName, result);
 
-                DiffCells(sheetName, cellsA, cellsB, result, options);
+                if (options.CompareValidations)
+                    DiffDataValidations(docA, docB, sA, sB, sheetName, result);
+
+                if (options.CompareConditionalFormats)
+                    DiffConditionalFormatting(docA, docB, sA, sB, sheetName, result);
+
+                if (options.CompareHiddenRowsCols)
+                    DiffHiddenRowsCols(docA, docB, sA, sB, sheetName, result);
+
+                var cellsA = ReadCells(docA, sA, options);
+                var cellsB = ReadCells(docB, sB, options);
+
+                DiffCells(sheetName, cellsA, cellsB, result, options, docA.WorkbookPart!, docB.WorkbookPart!);
             }
 
             progress?.Report(new ProgressInfo(100, "Finalizado."));
@@ -77,6 +88,7 @@ public sealed class ExcelComparer
     private sealed class WorkbookInfo
     {
         public Dictionary<string, SheetInfo> SheetsByName { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> SheetOrder { get; } = new();
     }
 
     private sealed class SheetInfo
@@ -108,6 +120,7 @@ public sealed class ExcelComparer
                 Hidden = state == SheetStateValues.Hidden,
                 VeryHidden = state == SheetStateValues.VeryHidden
             };
+            info.SheetOrder.Add(name);
         }
 
         return info;
@@ -143,15 +156,134 @@ public sealed class ExcelComparer
         }
     }
 
+    private static void DiffSheetOrder(SpreadsheetDocument docA, SpreadsheetDocument docB, ComparisonResult result)
+    {
+        var orderA = docA.WorkbookPart!.Workbook!.Sheets!.OfType<Sheet>().Select(s => s.Name!.Value!).ToList();
+        var orderB = docB.WorkbookPart!.Workbook!.Sheets!.OfType<Sheet>().Select(s => s.Name!.Value!).ToList();
+
+        // Report per-sheet position changes for better traceability
+        var indexA = orderA.Select((name, idx) => (name, idx)).ToDictionary(t => t.name, t => t.idx, StringComparer.OrdinalIgnoreCase);
+        var indexB = orderB.Select((name, idx) => (name, idx)).ToDictionary(t => t.name, t => t.idx, StringComparer.OrdinalIgnoreCase);
+        foreach (var name in indexA.Keys.Intersect(indexB.Keys, StringComparer.OrdinalIgnoreCase))
+        {
+            var ia = indexA[name];
+            var ib = indexB[name];
+            if (ia != ib)
+            {
+                result.Diffs.Add(new DiffItem(name, "", DiffKind.Modified, "SheetOrderIndex", ia.ToString(CultureInfo.InvariantCulture), ib.ToString(CultureInfo.InvariantCulture)));
+            }
+        }
+    }
+
+    // -------- Worksheet-level diffs --------
+
+    private static void DiffUsedRange(SpreadsheetDocument docA, SpreadsheetDocument docB, SheetInfo sA, SheetInfo sB, string sheetName, ComparisonResult result)
+    {
+        var urA = GetUsedRange(docA, sA);
+        var urB = GetUsedRange(docB, sB);
+        if (urA != urB)
+        {
+            result.Diffs.Add(new DiffItem(sheetName, "", DiffKind.Modified, "UsedRange", urA, urB));
+        }
+    }
+
+    private static string GetUsedRange(SpreadsheetDocument doc, SheetInfo sheet)
+    {
+        var wsPart = (WorksheetPart)doc.WorkbookPart!.GetPartById(sheet.RelId);
+        var ws = wsPart.Worksheet;
+        var dim = ws.SheetDimension?.Reference?.Value;
+        if (!string.IsNullOrWhiteSpace(dim)) return dim!;
+
+        var sheetData = ws.Elements<SheetData>().FirstOrDefault();
+        if (sheetData is null) return "";
+
+        int maxRow = 0;
+        int maxCol = 0;
+        foreach (var row in sheetData.Elements<Row>())
+        {
+            foreach (var cell in row.Elements<Cell>())
+            {
+                var addr = cell.CellReference?.Value;
+                if (string.IsNullOrWhiteSpace(addr)) continue;
+                ParseAddress(addr, out int r, out int c);
+                if (r > maxRow) maxRow = r;
+                if (c > maxCol) maxCol = c;
+            }
+        }
+        if (maxRow == 0 || maxCol == 0) return "";
+        return $"A1:{ColumnIndexToName(maxCol)}{maxRow}";
+    }
+
+    private static void DiffDataValidations(SpreadsheetDocument docA, SpreadsheetDocument docB, SheetInfo sA, SheetInfo sB, string sheetName, ComparisonResult result)
+    {
+        var valsA = GetDataValidationSummary(docA, sA);
+        var valsB = GetDataValidationSummary(docB, sB);
+        if (!StringEquals(valsA, valsB))
+        {
+            result.Diffs.Add(new DiffItem(sheetName, "", DiffKind.Modified, "DataValidation", valsA, valsB));
+        }
+    }
+
+    private static string GetDataValidationSummary(SpreadsheetDocument doc, SheetInfo sheet)
+    {
+        var wsPart = (WorksheetPart)doc.WorkbookPart!.GetPartById(sheet.RelId);
+        var ws = wsPart.Worksheet;
+        var dv = ws.Descendants<DataValidation>().ToList();
+        if (dv.Count == 0) return "";
+        var sb = new StringBuilder();
+        foreach (var d in dv)
+        {
+            var sqref = d.SequenceOfReferences?.InnerText ?? "";
+            var type = d.Type?.Value.ToString() ?? "";
+            var op = d.Operator?.Value.ToString() ?? "";
+            var f1 = d.Formula1?.Text ?? "";
+            var f2 = d.Formula2?.Text ?? "";
+            sb.Append('[').Append(sqref).Append("; ").Append(type).Append(' ').Append(op).Append("; ")
+              .Append(f1).Append(' ').Append(f2).Append(']');
+        }
+        return sb.ToString();
+    }
+
+    private static void DiffConditionalFormatting(SpreadsheetDocument docA, SpreadsheetDocument docB, SheetInfo sA, SheetInfo sB, string sheetName, ComparisonResult result)
+    {
+        var wsA = ((WorksheetPart)docA.WorkbookPart!.GetPartById(sA.RelId)).Worksheet;
+        var wsB = ((WorksheetPart)docB.WorkbookPart!.GetPartById(sB.RelId)).Worksheet;
+        var cfA = wsA.Descendants<ConditionalFormatting>().Select(cf => cf.InnerText).ToList();
+        var cfB = wsB.Descendants<ConditionalFormatting>().Select(cf => cf.InnerText).ToList();
+        if (!cfA.SequenceEqual(cfB))
+        {
+            result.Diffs.Add(new DiffItem(sheetName, "", DiffKind.Modified, "ConditionalFormatting",
+                string.Join("|", cfA), string.Join("|", cfB)));
+        }
+    }
+
+    private static void DiffHiddenRowsCols(SpreadsheetDocument docA, SpreadsheetDocument docB, SheetInfo sA, SheetInfo sB, string sheetName, ComparisonResult result)
+    {
+        var wsA = ((WorksheetPart)docA.WorkbookPart!.GetPartById(sA.RelId)).Worksheet;
+        var wsB = ((WorksheetPart)docB.WorkbookPart!.GetPartById(sB.RelId)).Worksheet;
+
+        var colsA = wsA.Elements<Columns>().FirstOrDefault()?.Elements<Column>().Where(c => c.Hidden != null && c.Hidden.Value).Select(c => $"{c.Min}-{c.Max}").OrderBy(x => x).ToList() ?? new();
+        var colsB = wsB.Elements<Columns>().FirstOrDefault()?.Elements<Column>().Where(c => c.Hidden != null && c.Hidden.Value).Select(c => $"{c.Min}-{c.Max}").OrderBy(x => x).ToList() ?? new();
+        if (!colsA.SequenceEqual(colsB))
+            result.Diffs.Add(new DiffItem(sheetName, "", DiffKind.Modified, "HiddenColumns", string.Join(",", colsA), string.Join(",", colsB)));
+
+        var rowsA = wsA.Descendants<Row>().Where(r => r.Hidden != null && r.Hidden.Value).Select(r => r.RowIndex!.Value).OrderBy(x => x).ToList();
+        var rowsB = wsB.Descendants<Row>().Where(r => r.Hidden != null && r.Hidden.Value).Select(r => r.RowIndex!.Value).OrderBy(x => x).ToList();
+        if (!rowsA.SequenceEqual(rowsB))
+            result.Diffs.Add(new DiffItem(sheetName, "", DiffKind.Modified, "HiddenRows", string.Join(",", rowsA), string.Join(",", rowsB)));
+    }
+
     // -------- Cell reading + diff --------
 
     private sealed class CellInfo
     {
         public string? ValueText { get; init; }     // normalizado a texto
         public string? FormulaText { get; init; }   // fórmula tal cual
+        public uint? StyleIndex { get; init; }      // styleId
+        public string? NumberFormatCode { get; init; } // resolved from styles
     }
 
-    private static Dictionary<string, CellInfo> ReadCells(SpreadsheetDocument doc, SheetInfo sheet)
+    private static Dictionary<string, CellInfo> ReadCells(SpreadsheetDocument doc, SheetInfo sheet, ComparisonOptions options)
     {
         var wbPart = doc.WorkbookPart!;
         var wsPart = (WorksheetPart)wbPart.GetPartById(sheet.RelId);
@@ -172,14 +304,25 @@ public sealed class ExcelComparer
                 var formula = cell.CellFormula?.Text;
                 var val = ReadCellValueAsText(cell, sharedStrings);
 
-                // Guardamos solo celdas relevantes (tocadas)
-                if (val is null && formula is null) continue;
+                uint? styleIdx = null;
+                string? nfCode = null;
+                if (options.CompareCellFormat)
+                {
+                    styleIdx = cell.StyleIndex?.Value;
+                    nfCode = ResolveNumberFormatCode(wbPart, styleIdx);
+                }
 
-                dict[addr] = new CellInfo
+                if (val is null && formula is null && !options.CompareCellFormat) continue;
+
+                var ci = new CellInfo
                 {
                     ValueText = val,
-                    FormulaText = formula
+                    FormulaText = formula,
+                    StyleIndex = styleIdx,
+                    NumberFormatCode = nfCode
                 };
+
+                dict[addr] = ci;
             }
         }
 
@@ -188,12 +331,15 @@ public sealed class ExcelComparer
 
     private static string? ReadCellValueAsText(Cell cell, SharedStringTable? sst)
     {
-        // Nota: este "ValueText" puede ser:
-        // - valor literal (para constantes)
-        // - valor cacheado en CellValue (para fórmulas, si existe)
-        // No intentamos recalcular.
-
-        if (cell.CellValue is null) return null;
+        if (cell.CellValue is null)
+        {
+            // Some inline strings use InlineString
+            if (cell.DataType?.Value == CellValues.InlineString)
+            {
+                return cell.InlineString?.Text?.Text ?? cell.InlineString?.InnerText;
+            }
+            return null;
+        }
         var raw = cell.CellValue.Text;
 
         if (cell.DataType?.Value == CellValues.SharedString)
@@ -208,12 +354,33 @@ public sealed class ExcelComparer
         return raw;
     }
 
+    private static string? ResolveNumberFormatCode(WorkbookPart wbPart, uint? styleIndex)
+    {
+        if (styleIndex is null) return null;
+        var styles = wbPart.WorkbookStylesPart?.Stylesheet;
+        if (styles is null) return null;
+        var cellXfs = styles.CellFormats?.Elements<CellFormat>().ToList();
+        if (cellXfs is null) return null;
+        var idx = (int)styleIndex.Value;
+        if (idx < 0 || idx >= cellXfs.Count) return null;
+        var xf = cellXfs[idx];
+        if (xf.NumberFormatId == null) return null;
+        var nfid = (int)xf.NumberFormatId.Value;
+        // Try custom number formats
+        var nfs = styles.NumberingFormats?.Elements<NumberingFormat>().FirstOrDefault(n => n.NumberFormatId != null && n.NumberFormatId.Value == nfid);
+        if (nfs != null) return nfs.FormatCode?.Value;
+        // Built-in formats: we can return the id
+        return nfid.ToString(CultureInfo.InvariantCulture);
+    }
+
     private static void DiffCells(
         string sheetName,
         Dictionary<string, CellInfo> a,
         Dictionary<string, CellInfo> b,
         ComparisonResult result,
-        ComparisonOptions options)
+        ComparisonOptions options,
+        WorkbookPart wbA,
+        WorkbookPart wbB)
     {
         var keys = a.Keys.Union(b.Keys, StringComparer.OrdinalIgnoreCase);
 
@@ -224,18 +391,15 @@ public sealed class ExcelComparer
 
             if (hasA && !hasB)
             {
-                // Removed
                 result.Diffs.Add(new DiffItem(sheetName, addr, DiffKind.Removed, "Cell", Summarize(cA, options), null));
                 continue;
             }
             if (!hasA && hasB)
             {
-                // Added
                 result.Diffs.Add(new DiffItem(sheetName, addr, DiffKind.Added, "Cell", null, Summarize(cB, options)));
                 continue;
             }
 
-            // ambos
             var changes = new List<DiffItem>();
 
             if (options.CompareValues)
@@ -252,6 +416,19 @@ public sealed class ExcelComparer
                 var fB = cB!.FormulaText;
                 if (!StringEquals(fA, fB))
                     changes.Add(new DiffItem(sheetName, addr, DiffKind.Modified, "Formula", fA, fB));
+            }
+
+            if (options.CompareCellFormat)
+            {
+                var sA = cA!.StyleIndex?.ToString();
+                var sB = cB!.StyleIndex?.ToString();
+                if (!StringEquals(sA, sB))
+                    changes.Add(new DiffItem(sheetName, addr, DiffKind.Modified, "StyleIndex", sA, sB));
+
+                var nfA = cA!.NumberFormatCode;
+                var nfB = cB!.NumberFormatCode;
+                if (!StringEquals(nfA, nfB))
+                    changes.Add(new DiffItem(sheetName, addr, DiffKind.Modified, "NumberFormat", nfA, nfB));
             }
 
             foreach (var ch in changes)
@@ -271,9 +448,46 @@ public sealed class ExcelComparer
             if (sb.Length > 0) sb.Append(" | ");
             sb.Append(c.ValueText);
         }
+        if (options.CompareCellFormat)
+        {
+            if (sb.Length > 0) sb.Append(" | ");
+            sb.Append("style:").Append(c.StyleIndex?.ToString() ?? "").Append(" nf:").Append(c.NumberFormatCode ?? "");
+        }
         return sb.Length == 0 ? null : sb.ToString();
     }
 
     private static bool StringEquals(string? a, string? b)
         => string.Equals(a ?? "", b ?? "", StringComparison.Ordinal);
+
+    private static void ParseAddress(string addr, out int row, out int col)
+    {
+        int i = 0;
+        while (i < addr.Length && char.IsLetter(addr[i])) i++;
+        var colStr = addr.Substring(0, i);
+        var rowStr = addr.Substring(i);
+        row = int.TryParse(rowStr, out var r) ? r : 0;
+        col = ColumnNameToIndex(colStr);
+    }
+
+    private static int ColumnNameToIndex(string name)
+    {
+        int result = 0;
+        foreach (var ch in name.ToUpperInvariant())
+        {
+            result = result * 26 + (ch - 'A' + 1);
+        }
+        return result;
+    }
+
+    private static string ColumnIndexToName(int index)
+    {
+        var sb = new StringBuilder();
+        while (index > 0)
+        {
+            int rem = (index - 1) % 26;
+            sb.Insert(0, (char)('A' + rem));
+            index = (index - 1) / 26;
+        }
+        return sb.ToString();
+    }
 }
